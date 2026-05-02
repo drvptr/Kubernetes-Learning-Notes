@@ -41,7 +41,7 @@
   - [16.1 NodePort](#161-nodeport)
   - [16.2 Ingress](#162-ingress)
   - [16.3 Gateway API](#163-gateway-api)
-  - [16.5 Управление CNI и DNS в Kubernetes](#165-управление-cni-и-dns-в-kubernetes)
+  - [16.4 Управление CNI и DNS в Kubernetes](#164-управление-cni-и-dns-в-kubernetes)
 - [17. Network Policies](#17-network-policies)
   - [17.1 Разрешение доступа к Pod по метке](#171-разрешение-доступа-к-pod-по-метке)
   - [17.2 Запрет доступа из других Namespace](#172-запрет-доступа-из-других-namespace)
@@ -2145,7 +2145,7 @@ kubectl apply -f http-routing.yaml
 ```
 Проверить доступность можно всё также через файл hosts.
 
-### 16.5 Управление CNI и DNS в Kubernetes
+### 16.4 Управление CNI и DNS в Kubernetes
 
 Cетевое взаимодействие между Pod'ами в Kubernetes обеспечивается CNI-плагином. В нашем случае используется *Calico*. Именно CNI отвечает за выдачу IP-адресов Pod'ам, настройку маршрутизации между нодами и сетевую связность внутри кластера. Посмотреть текущие IP-пулы Calico можно следующим образом:
 
