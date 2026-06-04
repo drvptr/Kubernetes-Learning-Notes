@@ -41,6 +41,7 @@ virt-install \
   --memory 2048 \
   --vcpus 2 \
   --disk path="$DISK",format=qcow2 \
+  --cdrom /vm/iso/ubuntu-24.04-live-server-amd64.iso \
   --network bridge=$LAN_BRIDGE,model=virtio \
   --graphics vnc,listen=127.0.0.1,port=-1 \
   --osinfo detect=on,require=off  || exit 1
