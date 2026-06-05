@@ -31,6 +31,6 @@ if [ -n "$WAN_IP" ] ; then
 	       	ip route add "$VM_NETWORK" via "$WAN_IP"
 	fi
 else
-	printf "Warning:\n\tLAN route is not added.\n\tEnsure that WAN MAC is correct in $0 file\n\tYou can find out it by the next command:\n\t\t virsh dumpxml <router_vm_name> | grep 'mac address'"
+	printf "Warning:\n\tLAN route is not added.\n\tEnsure that WAN MAC is correct in $0 file\n\tYou can find out it by the next command:\n\t\t virsh dumpxml <router_vm_name> | grep 'mac address'\n"
 fi
 
