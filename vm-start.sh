@@ -5,8 +5,8 @@ WAN_MAC="52:54:00:66:bf:48"
 
 if [ -z "$VMPTH" ] ; then
 	VMPTH="/vm"
-	if [ -d "$VMPTH" ] ; then
-		echo "Error: $VMPTH directory not exists. Please specify vm directory: VMPAPTH=/path-to-vm $0"
+	if ! [ -d "$VMPTH" ] ; then
+		echo "Error: $VMPTH directory not exists. Please specify vm directory: VMPTH=/path-to-vm $0"
 		exit 1
 	fi
 fi
