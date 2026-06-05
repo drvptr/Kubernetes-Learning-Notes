@@ -14,20 +14,20 @@ fi
 CHANGED=0
 for VM in $(ls /vm/*.qcow2) ; do
 	VM_NAME="$(basename $VM | rev | cut -d '.' -f 2- | rev)"
-	if virsh list --all | grep $VM_NAME | grep 'shut off' 2>&1 > /dev/null; then
+	if virsh list --all | grep $VM_NAME | grep 'shut off' > /dev/null 2>&1; then
 	       	virsh start $VM_NAME
-			CHANGED=1
+		CHANGED=1
 	fi
 done
 
 if [ $CHANGED -eq 1 ] ; then
-	sleep 20
+	sleep 30
 fi
 
 WAN_IP="$(arp-scan --interface=br-wan --localnet 2> /dev/null | grep '52:54:00:66:bf:48' | cut  -f 1,1)"
 
 if [ -n "$WAN_IP" ] ; then
-	if ! ip r | grep $VM_NETWORK 2>&1 > /dev/null ; then
+	if ! ip r | grep $VM_NETWORK > /dev/null 2>&1 ; then
 	       	ip route add "$VM_NETWORK" via "$WAN_IP"
 	fi
 else
