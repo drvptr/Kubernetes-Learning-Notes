@@ -29,6 +29,8 @@
   - [10.2 Sidecar-контейнеры](#102-sidecar-контейнеры)
 - [11. Автоматическое масштабирование (Autoscaling)](#11-автоматическое-масштабирование-autoscaling)
 - [12. Helm и Kustomize](#12-helm-и-kustomize)
+  - [12.1 Helm](#121-helm)
+  - [12.2 Kustomize](#122-kustomize)
 - [13. Управление Планированием](#13-управление-планированием)
   - [13.1 NodeSelector](#131-nodeselector)
   - [13.2 Affinity и Anti-Affinity](#132-affinity-и-anti-affinity)
@@ -1380,6 +1382,8 @@ sudo vim /etc/kubernetes/manifests/kube-controller-manager.yaml
 
 ## 12. Helm и Kustomize
 
+### 12.1 Helm
+
 Helm — это пакетный менеджер для Kubernetes, который позволяет устанавливать приложения как готовые пакеты (charts). Chart — это по сути набор шаблонов Kubernetes-манифестов плюс файл значений values.yaml. В этих шаблонах используются переменные, а конкретные значения подставляются из values.yaml, за счёт чего один и тот же chart можно переиспользовать с разной конфигурацией. Обычно работа с Helm начинается с добавления репозитория, в котором лежат charts. Скачать heml можно из [официального репозитория](https://github.com/helm/helm). Например, добавим популярный репозиторий *Bitnami* и обновим список пакетов:
 
 ```bash
@@ -1471,18 +1475,221 @@ helm template my-nginx bitnami/nginx -f values.yaml > nginx.yaml
 kubectl apply -f nginx.yaml
 ```
 
-Далее, поговорим немного об Kustomize — это встроенный в Kubernetes инструмент, который не использует шаблоны и переменные, а работает через “накладывание” изменений на уже существующие YAML-файлы. В основе лежит файл kustomization.yaml, в котором ты указываешь базовые ресурсы (deployment.yaml, service.yaml и т.д.) и описываешь, какие изменения к ним применить: например, добавить префикс к именам, изменить namespace, добавить общие labels. В основе лежит файл kustomization.yaml. Ниже приведён образец структуры файлов для kustomize:
-```txt
-- base
-   |- test-pod.yaml
-   \._ kustomization.yaml
-- overlays
-  |- dev
-  |    \._ kustomization.yaml
-  \._ prod
-       \._ kustomization.yam|
+### 12.2 Kustomize
+
+Представим ситуацию: у нас есть YAML-файл и нам необходимо создать несколько "версий" Pod'а, отличающихся лишь некоторыми параметрами. Для этого в kubernetes сущуествует способ не копироать YAML-файлы заново при каждом изменении, а накладывать изменения в виде патчей. Вместо того чтобы копировать и редактировать манифесты для каждого окружения, мы берём уже готовый YAML и описываем, что именно в нём нужно изменить: image, labels, namespace, ресурсы или другие поля. Эти изменения описываются отдельно в специальном файле `kustomization.yaml`, который работает как “инструкция по модификации” исходных манифестов. В результате Kubernetes применяет не исходный YAML напрямую, а уже собранную версию с наложенными изменениями. Продемонстрирем как это работает. Создадим  пробный Deploy:
+```bash
+kubectl create deploy test-dep --image=nginx --dry-run=client -o yaml > test-dep.yaml
+vim test-dep.yaml
 ```
-Например, создадим обычный манифест:
+Получили стандартный yaml c одной репликой:
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  creationTimestamp: null
+  labels:
+    app: test-dep
+  name: test-dep
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: test-dep
+  strategy: {}
+  template:
+    metadata:
+      creationTimestamp: null
+      labels:
+        app: test-dep
+    spec:
+      containers:
+      - image: nginx
+        name: nginx
+        resources: {}
+status: {}
+
+```
+Теперь разберём как нам написать `kustomization.yaml` файл. Он состоит из двух основных частей, первая представляет собой список файлов которые мы будем патчить, а вторая описывает модифицирующие действия. Первая часть называется `resources:`. В данном случае укажем в ней наш test-dep.yaml. Во второй части могут быть применены различные модификаторы, подробнее каждый из которых будет рассмотрен ниже. Например, наш `kustomization.yaml` может выглядеть так:
+```yaml
+resources:
+  - test-dep.yaml
+patches:
+  - target:
+      kind: Deployment
+      name: test-dep
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: test-dep
+      spec:
+        replicas: 3
+```
+Посмотреть что произойдёт после его применения можно следующей командой:
+```bash
+kubectl apply -k . --dry-run=client -o yaml
+```
+Как можно заметить из вывода, Deploy будет иметь три реплики. Команда похожа на `kubectl apply -f` но вместо буквы "f" тут "k" - "kustomize", и собственно в качестве аргумента указывается не сам kustomize.yaml, а каталог в котором он находится.
+
+В этом примере, в качестве модифицироующей части использовался `patches:`, который вносит точечные изменения в файл. Он состоит из списка "патчей", каждый из которых имеет `target` - то есть обьект к которому будет применяться патч, в данном случае это "Deployment/test-dep", и собственно секция `patch` в которой содержится сам тескт того что необходимо изменить. Если мы попробуем изменить параметр `metadata.name` - у нас ничего не получится. Дело в том что в данном случае наш патч **не изменяет** просто содержимое yaml-файла, как это могло показаться. В данном примере производится так называемый  "*Strategic Merge Patch (SMP)*", о котором подробнее будет рассказано позже, т.е. он способен изменить только всё то что можно сделать при помощи `kubectl scale` или `kubectl set image` и других уже известных модификаторов. 
+
+Всего существует четыре механизма kustomize:
+- (A) Resource composition - композиция ресурсов, "склеивает" несколько yaml в один файл.
+- (B) Transformers - глобальные изменения. При помощи него можно изменять метаданные, лейблы, префиксы имени, пространства имён.
+- (C) Patches - точечные изменения.
+- (D) Resource Generator - создание ресурсов.
+
+Рассмотрим механизм композиции. Например, создадим для нашего деплоя service:
+```bash
+kubectl create svc nodeport test-dep-svc --tcp='80:80' --node-port=30080 --dry-run=client -o yaml > test-dep-svc.yaml
+```
+В файле `kustomization.yaml`, удалим всё кроме секции `resources:`, в которую добавим наш service:
+```yaml
+resources:
+  - test-dep.yaml
+  - test-dep-svc.yaml
+```
+Проверим что получится:
+```bash
+kubectl apply -k . --dry-run=client -o yaml
+```
+Как видим, в результате получился файл в котором содержится и deployment и service. Таким образом, всё что указано в секции `resource` объединяется в один yaml.
+
+Далее, к глобальным параметрам относятся следующие секции:
+```yaml
+namespace: my-namespace
+namePrefix: dev-
+nameSuffix: "-001"
+labels:
+  - pairs:
+      app: bingo
+    includeSelectors: true 
+commonAnnotations:
+  oncallPager: 800-555-1212
+```
+Данные модификаторы действуют на все yaml указанные в `resources`, например, следующий `kustomization.yaml` добавим префикс "kustom-" в названия delpoy и services:
+```yaml
+resources:
+  - test-dep.yaml
+  - test-dep-svc.yaml
+namePrefix: kustom-
+```
+Проверить это можно следующей командой:
+```bash
+kubectl apply -k . --dry-run=client -o yaml
+```
+
+Теперь рассмотрим точечные изменения. За них отвечает секция `patches`, которая использовалась в первом примере. В отличии от глобальных модификаций, каждиый "патч" состоит из двух параметров, и параметр `target` - отвечает конкретно какой ресурс, или группа ресурсов будет попадать под модификацию. Таким образом, мы можем изменить содержимое только нашего deployment'a. Второй параметр патча может быть `patch: |-` - для inline текста, или `path: filename.yaml` - для текста в отдельном файле. Сам текст патча принимается в двух форматах: **strategicMerge** и **Json6902**. StrategicMerge был продемонстрирован в самом первом примере - он сопостовляет поля по `name` и обновляет их. Собственно, возниакет вопрос, а что делать если нам необходимо изменить название контейнера? Каким образом strategicMerge поймёт что нужно сделать, добавить новый sidecar-контейнер, или изменить имя старого? В таком случае, предусмотрены JSON-патчи. Чтобы найти правильный ресурс для патча Json6902. Например продемонстрируем следующий Json6902-патч:
+```yaml
+resources:
+  - test-dep.yaml
+  - test-dep-svc.yaml
+namePrefix: kustom-
+patches:
+  - target:
+      kind: Deployment
+      name: test-dep
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: aboba
+```
+Применим и посмотрим что получится:
+```bash
+kubectl apply -k .
+kubectl get deploy,svc
+```
+В итоге будут созданы следующие ресурсы:
+```txt
+service/kustom-test-dep-svc
+deployment.apps/kustom-aboba
+```
+Как мы видим, ресурс у наз назван не `aboba` как ожидалось, а `kustom-aboba`, потому что у нас также применён префикс на глобальном уровне.
+
+На практике, гораздо чаще используют четвёртый механизм - генерация ресурсов. Для него изначально и был придуман kustomize. В kubernetes есть такой ресурс как `configMap`, он содержит заготовленные файлы конфигурации для различных служб. Выглядит он примерно так:
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-config
+data:
+  nginx.conf: |
+    server {
+        listen 80;
+    }
+```
+То есть фактически такой файл состоит из двух частей: название и произвольные данные, в общем случае даже не обязательно конфигурационные. Благодаря нему, например мы можем автоматически загружать уже готовый index.html в различные Pod'ы, или даже задавать переменные среды. Просто, самое целесообразное применение этому именно конфигурация, поэтому он назван *configMap*.
+
+Собственно, усть геренации, в том чтобы создать ресурс из заготовленных данных, файлов, литералов или переменных среды. Вместо того чтобы писать:
+```bash
+kubectl create cm nginx-config --from-file=nginx.conf --dry-run=client -o yaml
+```
+Мы можем создать следующий `kustomization.yaml` файл:
+```yaml
+resources:
+  - test-dep.yaml
+  - test-dep-svc.yaml
+namePrefix: kustom-
+patches:
+  - target:
+      kind: Deployment
+      name: test-dep
+    patch: |-
+      kind: Deployment
+      metadata:
+        name: test-dep
+      spec:
+        template:
+          spec:
+            containers:
+            - name: nginx
+              volumeMounts:
+                - mountPath: /etc/nginx/sites-avalible/default
+                  name: default-site
+            volumes:
+            - name: nginx-conf
+              configMap:
+                name: nginx-conf
+configMapGenerator:
+  - name: nginx-conf
+    files:
+      - nginx.conf
+```
+И в результате kustomize он будет добавлен к resources:
+```bash
+kubectl apply -k . --dry-run=client -o yaml
+```
+Как можно заметить, произошла магия - в названии сгенерированного configMap автоматически добавился суффикс `nginx-conf-t76h69d47t`, хотя оригинальное название было просто `nginx-conf`, при чём этот суффикс был также автоматически добавлен в `spec.volumes`. Kustomize применяет встроенные reference rules, "если этот ConfigMap сгенерирован мной  -> значит я могу установить его alias". Суффикс с хэшем позволяет избежать конфликтов имён: даже если в кластере уже существует ConfigMap с базовым именем, Kustomize создаёт уникальный ресурс. Однако это добавляет возможные конфликты при ручном управлении ресурсами вне Kustomize. Если ConfigMap создаётся через Kustomize, а затем вручную создаётся ресурс с тем же базовым именем, это не гарантирует совместимость. Pod’ы всегда ссылаются на итоговое имя с хэшем, поэтому любые ручные копии ConfigMap не будут автоматически подхватываться. Чтобы отключить это поведение, можно использовать опцию `disableNameSuffixHash: true`:
+```yaml
+configMapGenerator:
+- name: example-configmap-3
+  literals:
+  - FOO=Bar
+generatorOptions:
+  disableNameSuffixHash: true
+  labels:
+    type: generated
+  annotations:
+    note: generated
+```
+Но лучше не изменять ConfigMap, созданный через Kustomize, вручную. Также, в этом примере продемонстрировано, что вместо секции `files`, можно также указать `literals` - т.е. произвольные данные и `envs`. Подробнее об этом будет раскрыто в главе про configMap.
+
+Обычно kuztomize не разбрасывают по всему каталогу как мы только что делали. Вместо этого файлы упорядочивают в структуру базовых каталогов и наслоений. Выглядит эта структура следующим образом:
+
+```txt
+- ./base
+     |- test-cm.yaml
+     |- test-svc.yaml
+     |- test-pod.yaml
+     \._ kustomization.yaml
+- ./overlays
+    |- dev
+    |    \._ kustomization.yaml
+    \._ prod
+         \._ kustomization.yam|
+```
+Файл `base/kustomization.yaml`, как правило содержит список *resources*, которые генерируются для каждого наслоения. Например, создадим обычный манифест:
 
 ```bash
 mkdir kustomize-demo
@@ -1513,19 +1720,19 @@ spec:
   restartPolicy: Always
 status: {}
 ```
-Мы можем применить их как есть А можем создать `base/kustomization.yaml` со следующим содержимым:
+Файл `base/kustomization.yaml` будет содержать только наш манифест:
 
 ```yaml
 resources:
   - test-pod.yaml
 ```
-Здесь `resources` — список YAML-файлов, которые мы хотим обработать. Теперь добавим overlay для *dev* `overlays/dev/kustomization.yaml`:
+Теперь добавим overlay для *dev* `overlays/dev/kustomization.yaml`:
 ```yaml
 resources:
   - ../../base
 namePrefix: dev-
 ```
-Overlay для prod - `overlays/prod/kustomization.yaml`:
+И overlay для *prod* - `overlays/prod/kustomization.yaml`:
 ```yaml
 resources:
   - ../../base
@@ -1537,7 +1744,7 @@ kubectl apply -k overlays/dev
 kubectl apply -k overlays/prod
 kubectl get pods
 ```
-Из вывода видно, что было создано два пода, с разными именами.
+Не смотря на то что в *overlays/dev/kustomization.yaml* указан только каталог *base*, Kustomize рекурсивно включает все ресурсы и применяет поверх них дополнительные модификации.
 
 ---
 
