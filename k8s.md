@@ -2321,131 +2321,217 @@ kubectl get pods hi-pod-5658c7cbd6-tdx5f -o yaml | grep -B2 -i 'priorityclass'
 * между Pod'ами и Service
 * между внешними пользователями и приложениями внутри кластера
 
-Связь между контейнерами внутри одного Pod обычно реализуется через IPC (*inter-process communication*), shared volumes или localhost. Отдельная “настоящая” сеть для этого не требуется, так как контейнеры одного Pod используют общий network namespace и фактически видят одну и ту же сеть. Связь между Pod'ами реализуется через CNI-плагины (*Container Network Interface*), например Calico, Flannel или Cilium. Именно они обеспечивают маршрутизацию, IP-адресацию и сетевое взаимодействие между нодами и Pod'ами. Для связи между Pod'ами и приложениями используются ресурсы *Service*. Они предоставляют стабильную точку доступа к Pod'ам, так как сами Pod'ы могут постоянно пересоздаваться и менять IP-адреса.
+Связь между контейнерами внутри одного Pod обычно реализуется через IPC (*inter-process communication*), shared volumes или localhost. Отдельная “настоящая” сеть для этого не требуется, так как контейнеры одного Pod используют общий network namespace и фактически видят одну и ту же сеть. Связь между Pod'ами реализуется через CNI-плагины (*Container Network Interface*), например Calico, Flannel или Cilium. Именно они обеспечивают маршрутизацию, IP-адресацию и сетевое взаимодействие между нодами и Pod'ами. Например, при создании Pod:
 
-Для доступа к приложениям извне обычно используются:
-* `Service` типа `NodePort` или `LoadBalancer`
-* `Ingress`
-* `Gateway API`
-
-Долгое время основным способом управления входящим HTTP/HTTPS-трафиком был *Ingress*. Однако сейчас Ingress находится в состоянии так называемого *feature freeze*, то есть новые возможности в него практически не добавляются. Постепенно Kubernetes переходит на более современный механизм — *Gateway API*, который предоставляет более гибкую и расширяемую модель сетевой маршрутизации.
-
-### 16.1 NodePort
-
-До этого момента мы запускали Pod'ы, но никак к ним не обращались. На самом деле к Pod'ам можно обратиться и напрямую, через их IP, который предоставляет плагин Calico:
 ```bash
-kubectl get pods -o wide
-curl -I http://192.168.235.169
+kubectl run test --image=nginx
+kubectl get pod -o wide
 ```
-Перед выполнением данного примера необходимо убедиться что firewall разрешает входящие соединения по 80/TCP. Ранее мы уже говорили что Pod'ы в Kubernetes постоянно пересоздаются и могут менять IP-адреса. Поэтому напрямую обращаться к Pod'ам — плохая идея. Для решения этой проблемы используются *Service*. Service предоставляет стабильную точку доступа к группе Pod'ов и автоматически отслеживает какие Pod'ы сейчас доступны. Service, это ресурс API, который связывает IP Pod'ов при помощи labels и selectors. Например Deployment создаёт Pod'ы с label `app=nginx`, а Service ищет Pod'ы с этим label и перенаправляет на них трафик. Существует несколько типов Service.
+
+Можно увидеть, что Pod получает IP вроде `192.168.235.131`. Этот IP выдаётся CNI-плагином и маршрутизируется между нодами, и доступен только в пределах кластера. Находясь на ноде или другом Pod'е мы можем проверить доступность нашего приложения:
+```bash
+curl -I 192.168.235.131
+```
+Перед выполнением данного примера необходимо убедиться что firewall разрешает входящие соединения по 80/TCP. Если удалить Pod и создать его заново, IP почти всегда изменится:
+```bash
+kubectl delete pod test
+kubectl run test --image=nginx
+```
+В моём случае IP изменился на `192.168.235.132`. Всвязи с изменением IP его невозможно использовать как стабильную точку доступа, ведь предполагается что Pod'ы могут свободно пересоздаваться при необходимости.
+
+Для решения этой проблемы Kubernetes использует объект **Service**. Они предоставляют стабильную точку доступа к Pod'ам.
+Создадим Service типа `clusterip` вручную:
+
+```bash
+kubectl create service clusterip test-svc --tcp=80:80
+kubectl get svc
+```
+Полученный IP отличается от того что нам предоставлял Calico. В моём случае это `10.102.118.85`. Попробуем обратиться к приложению по данному IP:
+```bash
+curl -I 10.102.118.85
+```
+И у нас ничего не сработает. Потому что Service ещё не знает, куда направлять трафик. 
+Если посмотреть Service:
+```bash
+kubectl describe svc test-svc
+kubectl get endpoints
+```
+Можно увидеть строку `Endpoints: <none>`  - Service не имеет backend’ов, у него нет Endpoints. Попробуем это исправить, для этого отредактируем service:
+```yaml
+kubectl edit svc test-svc
+```
+В поле `spec.selector` укажем label нашего Pod'a, в моём случае это 'run: test'. После чего, проверим доступ повторно:
+```bash
+curl -I 10.102.118.85'
+kubectl get endpoints
+```
+Теперь приложение отвечает на запросы.  Также заметим что у нас появились `endpoints`. После создания service включается ключевой механизм Kubernetes — Endpoint Controller. Это control plane компонент, который постоянно наблюдает за Service’ами и Pod’ами. Как только у Service появляется selector, например run=test, Endpoint Controller начинает работать в режиме reconciliation: он находит все Pod’ы, подходящие под selector, извлекает их IP и формирует объект Endpoints То есть причиной появления Endpoints является не сеть и не kube-proxy, а именно наличие Service с selector’ом, который запускает reconciliation-логику контроллера. Чтобы продемонстрировать суть, пересоздадим наш Pod:
+```bash
+kubectl delete pod test
+kubectl get endpoints
+kubectl run test --image=nginx
+kubectl get pod -o wide
+kubectl get endpoints
+curl -I 10.102.118.85
+```
+Как мы видим, calico-IP адрес нашего Pod'а изменился уже на `192.168.235.133`, в моём случае. Однако доступ к нему обеспечен по прежнему IP `10.102.118.85`. Пойдём дальше, и посмотрим что произойдёт если мы создадим второй Pod с тем же label, и изменим содержимое его страницы для наглядности:
+```bash
+kubectl run test2 --image=nginx --labels='run=test'
+kubectl exec -it test -- sh -c "echo 'TEST_1' > /usr/share/nginx/html/index.html"
+kubectl exec -it test2 -- sh -c "echo 'TEST_2' > /usr/share/nginx/html/index.html"
+```
+Проверим что будет если отправить GET-запрос нашему приложению:
+```bash
+root@control1:~# curl 10.102.118.85
+#TEST_1
+root@control1:~# curl 10.102.118.85
+#TEST_2
+```
+Ответы могут чередоваться. Это происходит потому, что Service выполняет балансировку между Endpoints.
+
+При создании service мы указывали тип `clusterip`. Если мы посмотрим подсказку, то можем заметить несколько типов service:
+```bash
+kubectl create svc --help
+```
+Собственно из них:
 - `ClusterIP` — тип по умолчанию. Такой Service доступен только внутри кластера. Kubernetes создаёт виртуальный IP-адрес и внутренний DNS, через который Pod'ы могут обращаться друг к другу. Снаружи такой Service недоступен.
-- `NodePort` — Kubernetes открывает определённый порт на каждой ноде кластера. После этого приложение становится доступно по IP самой ноды (не путать с IP Pod'а), на заданом порту. Когда запрос приходит на ноду — kube-proxy перенаправляет трафик на один из Pod'ов Service.
+- `NodePort` — Kubernetes открывает определённый порт на каждой ноде кластера. После этого приложение становится доступно по IP самой ноды, на заданом порту. Когда запрос приходит на ноду — kube-proxy перенаправляет трафик на один из Pod'ов Service.
 - `LoadBalancer` — обычно используется в облаках. Kubernetes просит cloud provider создать внешний балансировщик нагрузки и связать его с Service. Внутри такой Service обычно всё равно использует ClusterIP или NodePort.
 - `ExternalName` — особый тип Service. Он вообще не проксирует трафик, а просто создаёт DNS CNAME запись на внешний ресурс.
 
-Продемонстрируем на практике, как можно создать сервис типа *NodePort*. Для начала создадим Deployment:
+### 16.1 NodePort
+
+До этого момента, все наши приложения были доступны только внутри кластера. Само собой разумеется, нам необходимо обеспечить возможность отправлять запросы приложению находясь вне сети кластера - конечный пользователь так или иначе должен иметь доступ к нашему сайту. Попробуем зайти на сайт по IP нашей ноды. Для этого с хост-системы (или с виртуальной машины в той же сети) выполним следующую команду:
+```bash
+curl 192.168.56.111
+```
+Разумеется, у нас ничего не получится, ведь мы ничего не сделали чтобы доступ к Pod'ам обеспечивался с внешних хостов. Можно задаться вопросом: если ClusterIP уже даёт стабильную точку доступа к набору Pod’ов, почему бы не использовать его напрямую снаружи кластера? Чтобы ответить на это, нужно понять, где вообще “живёт” ClusterIP. Когда создаётся Service, ClusterIP представляет собой набор правил iptables - он не имеет физического или виртуального интерфейса, он не маршрутизируем - через него нет ARP/route - он не участвует в L2/L3 сетевых уровнях вообще. Вместо этого kube-proxy на каждой ноде создаёт правила в ядро Linux - iptables или ipvs, которые говорят: если пакет пришёл на ClusterIP и порт Service — перенаправь его на один из Pod IP, указанных в Endpoints. То есть ClusterIP — это полностью виртуальная конструкция, реализованная через правила NAT внутри kernel space на каждой ноде. Он “живёт” одновременно на всех нодах, но физически не привязан ни к одной из них и не существует в L2/L3 сети. Одним словом в ядре Linux нет интерфейса и нет маршрута до него, но в kube-proxy он присутствует как match-условие. Поэтому пакет “никогда не идёт к ClusterIP”, он всегда перехватывается на ноде через netfilter до стадии маршрутизации Собственно, поэтому, мы фактически не можем напрямую для него настроить передачу пакетов на L2 уровне, ведь у нас он просто отсутвтует. 
+
+Если попытаться решить задачу, один из очевидных вариантов — выбрать одну ноду и настроить на этой ноде NAT: добавить iptables правило вида:
 
 ```bash
-kubectl create deploy webshop --image=nginx --replicas=3
-kubectl get pods -o wide
+iptables -t nat -N MY-NODEPORT
+iptables -t nat -A MY-NODEPORT -j MARK --set-xmark 0x4000/0x4000
+iptables -t nat -A MY-NODEPORT -p tcp -j DNAT --to-destination 192.168.235.133:80
+iptables -t nat -A PREROUTING -p tcp  -d 192.168.56.111 --dport 8081 -j MY-NODEPORT
+iptables -t nat -A OUTPUT -p tcp -d 192.168.56.111 --dport 8081 -j MY-NODEPORT
 ```
-
-Теперь создадим Service. Команда `kubectl expose` автоматически создаёт Service для Deployment:
+Теперь с хост-системы или виртуальной машины имеющей маршрутизацию до нашей сети выполним команду:
 ```bash
-kubectl expose deploy webshop --type=NodePort --port=80
-kubectl get svc
-kubectl describe svc webshop
+curl 192.168.56.111:8081
 ```
-Но важно понимать что expose — это просто удобная обёртка. Точно такой же Service можно создать вручную (лейбл `app=webshop` обычно создаётся автоматически):
-```yaml
-apiVersion: v1
-kind: Service
-metadata:
-  name: webshop-manual
-spec:
-  type: NodePort
-  selector:
-    app: webshop
-  ports:
-  - port: 80
-    targetPort: 80
-    nodePort: 30080
-```
-В выводе `describe` нас интересует строка `NodePort:` в моём случае Kubernetes автоматически назначил NodePort 30827/TCP. Теперь приложение доступно извне:
+Таким хитрым образом мы создали доступ к endpoint для клиентов - пользователи могут заходить на наш сайт. Решение хорошее, но необходимость в его реализации отсутствует - Kubernetes уже обеспечил подобного рода механизм NodePort как стандартизированное решение этой схемы. Вместо того чтобы вручную делать внешний → Node → endpoint NAT, Kubernetes просто добавляет ещё одну входную точку прямо в kube-proxy: открывает порт на всех нодах и добавляет iptables правило на уровне NodeIP:NodePort. То есть тип service NodePort НЕ создаёт новый Service и НЕ меняет Endpoints - он просто добавляет ещё одну точку входа в те же самые iptables правила.
+
+Продемонстрируем на практике, что делает сервис типа *NodePort*. Для этого изменим у нашего сервиса `spec.type` на `NodePort`:
 
 ```bash
-curl 192.168.56.111:30827
+kubectl edit svc test-svc
+kubectl describe svc test-svc
 ```
+В выводе `describe` нас интересует строка `NodePort:` в моём случае Kubernetes автоматически назначил 32684/TCP. Теперь приложение доступно для внешнего пользователя по данному порту:
+
+```bash
+curl 192.168.56.111:32684
+```
+
 Kubernetes открывает указанный порт на каждой ноде кластера. При обращении клиента на `<NodeIP>:<NodePort>` запрос сначала попадает на саму ноду, а затем обрабатывается компонентом *kube-proxy*. 
 ```bash
 kubectl get pods -n kube-system -o wide | grep 'kube-proxy'
 ```
-Именно kube-proxy отслеживает Service и список доступных Pod'ов (*Endpoints*) через API Kubernetes и настраивает правила iptables или IPVS для перенаправления трафика. После получения запроса kube-proxy выбирает один из Pod'ов Service и перенаправляет трафик на его IP-адрес. При этом совершенно не важно на какой ноде находится Pod — запрос может прийти на worker1, а kube-proxy перенаправит его на Pod который работает на worker2. Продемонстрируем сказанное. Для этого изменим главную страничку сайта на каждом Pod'e нашего деплоя:
+Именно kube-proxy отслеживает Service и список доступных Pod'ов через API Kubernetes и настраивает правила iptables или IPVS для перенаправления трафика. После получения запроса kube-proxy выбирает один из Pod'ов Service и перенаправляет трафик на его IP-адрес. Endpoint Controller и kube-proxy работают на разных уровнях. Endpoint Controller является частью Pod'а `kube-controller-manager` и занимается тем, что наблюдает за состоянием кластера: он смотрит на Service с label-селектором, находит подходящие Pod’ы и формирует объект Endpoints, то есть по сути фиксирует “живые адреса” приложений. kube-proxy же вообще не принимает решений о том, какие Pod’ы должны обслуживать трафик — он просто берёт уже готовые Endpoints и превращает их в правила ядра Linux (iptables или ipvs), которые реально перенаправляют пакеты. Поэтому можно сказать так: Endpoint Controller отвечает за то, кто сейчас является частью сервиса, а kube-proxy отвечает за то, как именно сетевой трафик до этих участников будет доставлен.
+
+Кстати, вручную создавать yaml Service не обязательно — Kubernetes предоставляет более простой способ через `kubectl expose`. Эта команда автоматически создаёт объект Service на основе уже существующего Pod или Deployment, подставляя нужный selector и порты. Например, вместо написания YAML можно просто выполнить 
 ```bash
- for i in $(kubectl get pods -o wide | grep 'webshop' | cut -f 1,1 -d ' ') ; do \
-     kubectl exec -it $i -- sh -c 'echo "Hello from $1" > /usr/share/nginx/html/index.html' _ $i ;\
- done ;
- curl 192.168.56.111:30827
- curl 192.168.56.111:30827
- curl 192.168.56.111:30827
-``` 
-Заметим что при каждом запросе, выдаются разные ответы, в том числе от Pod'а работающего на *worker2*. Таким образом Service балансирует трафик между всеми Pod'ами во всём кластере, а клиенту достаточно знать только IP любой ноды и NodePort Service.
+kubectl expose pod test --type=NodePort --port=80
+```
+и Kubernetes сам создаст Service, свяжет его с Pod’ами через labels.
 
 ### 16.2 Ingress
 
-Однако у NodePort есть недостаток — неудобно использовать IP и случайные порты. Для HTTP/HTTPS приложений обычно используют *Ingress*. Ingress — это API ресурс который управляет входящим HTTP/HTTPS трафиком. Он позволяет маршрутизировать запросы по доменам и URL путям. Например:
-* `shop.example.com` → webshop
-* `shop.example.com/admin` → admin-service
+NodePort в Kubernetes открывает фиксированный порт на каждой ноде кластера из диапазона 30000–32767. Этот диапазон выбран специально, чтобы избежать конфликтов с системными и стандартными сервисами, которые уже могут использовать “обычные” порты вроде 80 или 443. Формально этот диапазон можно изменить, но на практике это редко делают, так как это легко может привести к конфликтам с другими сервисами или уже существующей инфраструктурой, где порты заранее зарезервированы.
 
-Сам Kubernetes не умеет обрабатывать Ingress “из коробки”. Ingress — это только объект API с правилами маршрутизации. Чтобы он реально работал нужен *Ingress Controller* — отдельное приложение которое читает ресурсы Ingress и настраивает nginx, haproxy или другой reverse proxy. Самое интересное тут то что Ingress Controller использует *Custom Resource Definitions* (CRD). Kubernetes вообще позволяет создавать собственные типы ресурсов помимо Pod, Service и Deployment. Именно поэтому экосистема Kubernetes настолько расширяема — практически любой оператор или controller добавляет свои собственные API объекты.
-
-Установим ingress-nginx controller через Helm:
+Проблема NodePort заключается не в самом диапазоне, проблема заключается количестве портов. Доступ к приложению по различным портам неудобен с точки зрения пользователя и архитектуры приложения. Особенно это становится заметно, когда в кластере появляется несколько независимых частей системы: например, отдельный deployment для нашего вымышленного интернет-магазина webshop и отдельный для веб-клиента электронной почты mail. В таком случае пользователю пришлось бы объяснять, что разные части одного продукта находятся на разных портах, например http://site.com:30091 для почты и http://site.com:30080 для магазина. Даже если не думать о пользователях, такая схема плохо масштабируется: получается что подобные ссылки с портами, нам необходимо интегрировать сразу в код, документацию и конфигурации, и любая смена порта превращается в проблему. Кроме того, при объединении сервисов или изменении архитектуры можно легко получить конфликт портов или необходимость переписывать ссылки. Адекватным действием в данной ситуации становится введение обратного прокси. Например, можно поднять обычный nginx и настроить маршрутизацию по путям. Так и сделаем:
 ```bash
-helm upgrade --install ingress-nginx ingress-nginx --repo https://kubernetes.github.io/ingress-nginx --namespace ingress-nginx --create-namespace
-kubectl get pods -n ingress-nginx
+apt install nginx
+cat  > /etc/nginx/sites-available/default <<EOF
+server { 
+        listen 80 default_server; 
+        location / { 
+           proxy_pass http://127.0.0.1:32684; 
+        } 
+} 
+EOF
+nginx -t
+systemctl start nginx
+nginx -s reload
+curl 192.168.56.111
+```
+Теперь с любого внешнего устройства наше приложение доступно по нормальному порту, и можно спокойно добавить proxy_pass на location типо */webshop* или */mail*. Однако нельзя не заметить серьёзный архитектурный недостаток: весь входящий трафик начинает зависеть от одной ноды `control1`, на которой собственно запущен этот nginx! Если эта нода выходит из строя, падает весь входной слой системы, и фактически вся доступность кластера становится равна доступности одного сервера. Всё для чего мы использовали kubernetes идёт в мусор, ведь отказоустойчивость мы потеряли. Кроме того, при изменении порта, нам всё же придётся вручную копаться с конфигурацией nginx и svc.
+
+Очевидно, чтобы такой проблемы не возникало, сам слой реверс-прокси должен быть частью Kubernetes и подчиняться тем же принципам, что и остальные компоненты: перезапускаться при сбоях, перемещаться между нодами и масштабироваться при необходимости. Именно для этого и был введён механизм Ingress — он позволяет описывать правила маршрутизации на уровне кластера, а реализация этих правил выполняется Ingress Controller’ом, который работает как управляемый Kubernetes компонент и не привязан к одной конкретной ноде.
+
+Сам Kubernetes не умеет обрабатывать Ingress “из коробки”, однако по умолчанию он предоставляет "пустой" объект API с правилами маршрутизации. Чтобы он реально работал нужен *Ingress Controller* — отдельное приложение которое читает ресурсы Ingress и настраивает nginx, haproxy или другой reverse proxy.
+
+Не смотря на то что создавать правила ingress мы можем и на чистом kubernetes, это не делает смысла так как работать без контроллера они не будут. Поэтому установим ingress-nginx controller через Helm, имеет смысл сделать это в отдельном namespace, чтобы потом всё можно было удобно удалить:
+```bash
+helm upgrade --install ingress-nginx ingress-nginx \
+  --repo https://kubernetes.github.io/ingress-nginx \
+  --namespace ingress-nginx \
+  --create-namespace \
+  --set controller.service.type=ClusterIP \
+  --set controller.hostPort.enabled=true \
+  --set controller.replicaCount=2 
+  
+kubectl get pods --o wide -n ingress-nginx
 ```
 
 Теперь создадим приложение:
 ```bash
-kubectl create deploy nginxsvc --image=nginx --port=80
-kubectl expose deploy nginxsvc --port=80
-kubectl describe svc nginxsvc
+kubectl create deploy webshop --image=nginx
+kubectl expose deploy webshop --port=80 --name='webshop-svc'
+kubectl describe svc webshop
 ```
 
 Создадим ingress:
 ```bash
-kubectl create ing nginxsvc --class=nginx --rule=nginxsvc.info/*=nginxsvc:80
+kubectl create ing webshop-ing --class=nginx --rule=webshop.com/*=webshop-svc:80
 ```
+Здесь:`--class=nginx` — какой ingress controller должен обработать ресурс. После установки контроллера, нам была выдана подсказка что используется класс nginx; `webshop.com/*` — домен и путь, аналог location в конфигурации nginx,`webshop-svc:80` — backend service.
 
 Добавим запись в `/etc/hosts`:
-```text
-192.168.56.101 nginxsvc.info
-```
-Здесь:`--class=nginx` — какой ingress controller должен обработать ресурс,`nginxsvc.info/*` — домен и путь,`nginxsvc:80` — backend service Для тестирования пробросим порт ingress controller:
-
 ```bash
-kubectl port-forward -n ingress-nginx svc/ingress-nginx-controller 8080:80 &
+echo '192.168.56.121 webshop.com' >> /etc/hosts
 ```
 
 Теперь проверим:
 ```bash
-curl nginxsvc.info:8080
+curl http://webshop.com/
+curl http://webshop.com/
+curl http://webshop.com/
 ```
+Отлично, теперь мы можем заходить на сайт по нормальному, балансировка работает. Внимательный читатель мог заметить что в `/etc/hosts` мы указали IP именно нашей ноды worker1. Почему не conrtol1? В данном случае мы используем ingress-controller `hostport` который слушает 80 порт прямо на ноде, на которой он расположен. Попробуем выключить ноду worker1 и посмотерть что из этого получится:
+```bash
+ssh worker1
+shutdown now
+sed -i 's|192.168.56.121 webshop.com|192.168.56.122 webshop.com|g' /etc/hosts
+curl http://webshop.com/
+```
+Как мы видим, доступ к сайту мы не потеряли за счёт контроллера на второй ноде, ведь мы при установке указали value `controller.replicaCount=2`. Недоступность старого IP в данном случае не проблема, так как мы бы могли установить keepalived на каждой ноде. Таким образом ingress controller обладает всеми теми же преимуществами kubernetes что и deployment, чего нельзя было сказать про nginx на conrtol1. Это не единственный плюс, кроме того ingress-controller'ы имеют разные способы публикации, например мы бы могли сделать контроллер способа *nodeport* который автоматически создаёт одноимённого типа сервисы автоматически.
 
 Ingress поддерживает несколько правил одновременно. Для этого создадим ещё backend:
 ```bash
-kubectl create deploy newdep --image=gcr.io/google-samples/hello-app:2.0
-kubectl expose deploy newdep --port=80 --target-port=8080
-kubectl create ing webshop-ingress --rule=webshop.info/=webshop:80 --rule=webshop.info/hello=newdep:80
+echo '192.168.56.121 site.com' >> /etc/hosts
+kubectl create deploy mail --image=gcr.io/google-samples/hello-app:2.0
+kubectl expose deploy mail --port=80 --target-port=8080 --name='mail-svc'
+kubectl create ing site-ing  --class=nginx --rule=site.com/=webshop-svc:80 --rule=site.com/mail=mail-svc:80
 ```
 
 И протестируем:
 ```bash
-kubectl port-forward -n ingress-nginx svc/ingress-nginx-controller 8080:80 &
-curl http://webshop.info:8080/hello
-curl http://webshop.info:8080
+curl http://site.com/
+curl http://site.com/
+curl http://site.com/mail
 ```
-Команда `kubectl port-forward` позволяет пробросить локальный порт напрямую в Pod или Service без создания NodePort или Ingress. Это полезно для отладки и тестирования.
 
 ### 16.3 Gateway API
 
