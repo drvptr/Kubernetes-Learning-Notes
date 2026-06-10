@@ -2337,7 +2337,7 @@ curl -I 192.168.235.131
 kubectl delete pod test
 kubectl run test --image=nginx
 ```
-В моём случае IP изменился на `192.168.235.132`. Всвязи с изменением IP его невозможно использовать как стабильную точку доступа, ведь предполагается что Pod'ы могут свободно пересоздаваться при необходимости.
+В моём случае IP изменился на `192.168.235.132`. В связи с изменением IP его невозможно использовать как стабильную точку доступа, ведь предполагается что Pod'ы могут свободно пересоздаваться при необходимости.
 
 Для решения этой проблемы Kubernetes использует объект **Service**. Они предоставляют стабильную точку доступа к Pod'ам.
 Создадим Service типа `clusterip` вручную:
@@ -2362,7 +2362,7 @@ kubectl edit svc test-svc
 ```
 В поле `spec.selector` укажем label нашего Pod'a, в моём случае это 'run: test'. После чего, проверим доступ повторно:
 ```bash
-curl -I 10.102.118.85'
+curl -I 10.102.118.85
 kubectl get endpoints
 ```
 Теперь приложение отвечает на запросы.  Также заметим что у нас появились `endpoints`. После создания service включается ключевой механизм Kubernetes — Endpoint Controller. Это control plane компонент, который постоянно наблюдает за Service’ами и Pod’ами. Как только у Service появляется selector, например run=test, Endpoint Controller начинает работать в режиме reconciliation: он находит все Pod’ы, подходящие под selector, извлекает их IP и формирует объект Endpoints То есть причиной появления Endpoints является не сеть и не kube-proxy, а именно наличие Service с selector’ом, который запускает reconciliation-логику контроллера. Чтобы продемонстрировать суть, пересоздадим наш Pod:
@@ -2516,7 +2516,7 @@ shutdown now
 sed -i 's|192.168.56.121 webshop.com|192.168.56.122 webshop.com|g' /etc/hosts
 curl http://webshop.com/
 ```
-Как мы видим, доступ к сайту мы не потеряли за счёт контроллера на второй ноде, ведь мы при установке указали value `controller.replicaCount=2`. Недоступность старого IP в данном случае не проблема, так как мы бы могли установить keepalived на каждой ноде. Таким образом ingress controller обладает всеми теми же преимуществами kubernetes что и deployment, чего нельзя было сказать про nginx на conrtol1. Это не единственный плюс, кроме того ingress-controller'ы имеют разные способы публикации, например мы бы могли сделать контроллер способа *nodeport* который автоматически создаёт одноимённого типа сервисы автоматически.
+Как мы видим, доступ к сайту мы не потеряли за счёт контроллера на второй ноде, ведь мы при установке указали value `controller.replicaCount=2`. Недоступность старого IP в данном случае не проблема, так как мы бы могли установить keepalived на каждой ноде. Таким образом ingress controller обладает всеми теми же преимуществами kubernetes что и deployment, чего нельзя было сказать про nginx на conrtol1. Это не единственный плюс, кроме того ingress-controller'ы имеют разные способы публикации, например мы бы могли сделать контроллер способа *nodeport* который создаёт одноимённого типа сервисы автоматически.
 
 Ingress поддерживает несколько правил одновременно. Для этого создадим ещё backend:
 ```bash
@@ -2532,66 +2532,82 @@ curl http://site.com/
 curl http://site.com/
 curl http://site.com/mail
 ```
+Ingress Controller — это обычное приложение, которое понимает объект Ingress и умеет превращать его в реальную конфигурацию прокси. Например, мы можем посмотреть его конфигурацию при помощи следующей команды:
+```bash
+kubectl exec -n ingress-nginx   deploy/ingress-nginx-controller   -- cat /etc/nginx/nginx.conf | less
+```
 
 ### 16.3 Gateway API
 
-Долгое время *Ingress* был основным способом управления входящим HTTP-трафиком в Kubernetes, однако сейчас Ingress находится в состоянии *feature freeze*, то есть новый функционал в него практически не добавляется. Постепенно Kubernetes переходит на *Gateway API* — более современную и расширяемую модель сетевой маршрутизации. В отличие от Ingress, который в основном ориентирован только на HTTP/HTTPS, Gateway API поддерживает разные типы трафика, включая TCP, TLS, UDP и gRPC. Кроме того, Gateway API предоставляет более гибкую архитектуру, разделяя сетевую инфраструктуру и правила маршрутизации на отдельные ресурсы. Это позволяет администраторам управлять самими gateway, а разработчикам — только маршрутами приложений. Также Gateway API решает одну из старых проблем Ingress — большое количество vendor-specific аннотаций у разных ingress-controller, предоставляя более стандартизированную API-модель.
+Долгое время *Ingress* был основным способом управления входящим HTTP-трафиком в Kubernetes, однако сейчас Ingress находится в состоянии *feature freeze*, то есть новый функционал в него практически не добавляется. Постепенно Kubernetes переходит на *Gateway API* — более современную и расширяемую модель сетевой маршрутизации. 
+
+Основной недостаток Ingress заключается в том, что более гибкие возможности маршрутизации не стандартизированы. Мы, как администраторы кластера, можем только создавать правила для HTTP-маршрутизации. На практике, нам может потребоваться более сложные правила. Например, представим что мы выкатываем новую версию магазина и хотим отправлять на неё только 10% пользователей. Либо хотим маршрутизировать пользователей по какому-нибудь HTTP-заголовку. Сам объект Ingress ничего подобного описывать не умеет, реализацию данных правил берёт на себя ingress-контроллер и его внутренняя конфигурация. Зачастую, подобную конфигурацию выводят в annotations и CRD. Например, наш nginx из предыдущего примера вовсе не выполняет балансировку запросов - балансировка происходит уже на этапе service. Но это можно было бы и исправить, например установить ingress-контроллер на основе haproxy, и задать разновидность балансировки round-robin. В результате появляется неприятная ситуация: формально мы используем стандартный ресурс Kubernetes, однако реальные возможности оказываются привязаны к конкретному ingress-controller. Перейти с nginx на HAProxy или Traefik становится значительно сложнее, поскольку приходится переписывать конфигурацию. Gateway API решает эту проблему, создавая более разнообразные механизмы маршрутизации в стандартные ресурсы Kubernetes и разделяя инфраструктурную часть (Gateway) от правил маршрутизации приложений (HTTPRoute).
 
 В Gateway API появляются новые ресурсы:
 * `GatewayClass` - описывает сам gateway controller.
 * `Gateway` - описывает точку входа трафика.
 * `HTTPRoute` - описывает правила маршрутизации к Service.
 
-Установим Gateway API CRD — это набор Custom Resource Definitions для Kubernetes, который добавляет в кластер новые ресурсы Gateway API:
+Для начала установим Gateway API CRD — это набор Custom Resource Definitions для Kubernetes, который добавляет в кластер новые ресурсы Gateway API:
 ```bash
 kubectl kustomize https://github.com/nginxinc/nginx-gateway-fabric/config/crd/gateway-api/standard?ref=v1.5.1 | kubectl apply -f -
 ```
 
-Установим gateway controller:
+А также установим gateway controller:
 ```bash
-helm install ngf oci://ghcr.io/nginxinc/charts/nginx-gateway-fabric --create-namespace -n nginx-gateway
-kubectl edit -n nginx-gateway svc ngf-nginx-gateway-fabric
+helm install ngf oci://ghcr.io/nginxinc/charts/nginx-gateway-fabric --create-namespace -n nginx-gateway --set service.type=NodePort
 ```
 
 Создадим приложение:
 ```bash
-kubectl create deploy nginxgw --image=nginx --replicas=3
-kubectl expose deploy nginxgw --port=80
+kubectl create deploy myblog --image=nginx --replicas=3
+kubectl expose deploy myblog --port=80 --name='myblog-svc'
 ```
 
-Создадим правило маршрутизции, как ресурс Gateway и HTTPRoute:
+В отличие от Ingress, где точка входа и правила маршрутизации описываются одним объектом, Gateway API разделяет эти обязанности на несколько независимых ресурсов. Объект Gateway отвечает только за создание точки входа в кластер, которая может использоваться для обработки трафика, то есть для фильтрации, балансировки, разделения и т. д. для бэкэндов. Напишем Gateway для нашего приложения:
 ```yaml
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
-  name: example-gateway
+  name: myblog-gw
 spec:
   gatewayClassName: nginx
   listeners:
   - name: http
     protocol: HTTP
     port: 80
----
+```
+В данном примере создаётся HTTP-шлюз, который принимает соединения на 80 порту. Однако пока что он ничего не знает ни о сервисах, ни о путях вроде /mail или /shop. Для описания самих правил маршрутизации используются отдельные ресурсы, например HTTPRoute, которые мы рассмотрим далее. Такое разделение позволяет администраторам управлять сетевой инфраструктурой независимо от разработчиков приложений, которым требуется лишь добавлять собственные маршруты.
+
+Если объект Gateway отвечает за создание точки входа в кластер, то ресурс HTTPRoute содержит непосредственно правила маршрутизации. Именно здесь указывается какие домены должны обрабатываться, какие URL-пути необходимо сопоставлять и в какой backend-service следует передавать запросы. По сути, HTTPRoute играет ту же роль, что и раздел rules в объекте Ingress.
+
+```yaml
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
-  name: example-route
+  name: myblog-route
 spec:
   parentRefs:
-  - name: example-gateway
+  - name: myblog-gw
   hostnames:
-  - "whatever.com"
+  - "myblog.info"
   rules:
   - backendRefs:
-    - name: nginxgw
+    - name: myblog-svc
       port: 80
 ```
 
-И применим маршрутизацию:
+Применим данные манифесты:
 ```bash
+kubectl apply -f http-gw.yaml
 kubectl apply -f http-routing.yaml
 ```
-Проверить доступность можно всё также через файл hosts.
+Проверить доступность можно всё также через файл hosts:
+```bash
+echo '10.0.0.11 myblog.info' >> /etc/hosts
+kubectl get svc -n nginx-gateway
+curl http://myblog.info:31399
+```
 
 ### 16.4 Управление CNI и DNS в Kubernetes
 
