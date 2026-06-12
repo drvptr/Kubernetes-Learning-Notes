@@ -3139,15 +3139,20 @@ spec:
 
 ## 19. ConfigMap и Secret
 
-В Kubernetes `ConfigMap` используется для хранения конфигурационных данных приложения. Это отдельный API-ресурс, который позволяет хранить site-specific параметры: переменные окружения, startup-аргументы, конфигурационные файлы и другие настройки, которые не должны быть жёстко зашиты внутрь Docker-образа. Благодаря `ConfigMap` один и тот же контейнер можно использовать в разных окружениях, изменяя только конфигурацию Kubernetes без пересборки image. Ресурс `Secret` работает по похожему принципу, но предназначен для хранения чувствительных данных: паролей, токенов, ключей и т.д. В отличие от `ConfigMap`, данные в `Secret` хранятся в base64-представлении. При этом важно понимать, что base64 не является шифрованием — это лишь способ кодирования данных.
+В Kubernetes `ConfigMap` используется для хранения произвольных данных, чаще всего  конфигурационных. Это отдельный API-ресурс, который позволяет хранить site-specific параметры: переменные окружения, startup-аргументы, конфигурационные файлы и другие настройки, которые не должны быть жёстко зашиты внутрь Docker-образа. Благодаря `ConfigMap` один и тот же контейнер можно использовать в разных окружениях, изменяя только конфигурацию Kubernetes без пересборки image. Ресурс `Secret` работает по похожему принципу, но предназначен для хранения чувствительных данных: паролей, токенов, ключей и т.д. В отличие от `ConfigMap`, данные в `Secret` хранятся в base64-представлении. При этом важно понимать, что base64 не является шифрованием — это лишь способ кодирования данных.
 
-`ConfigMap` и `Secret` могут подключаться к Pod’ам двумя основными способами:
-* как environment variables;
-* как volume с файлами конфигурации.
+Представим, что мы написали приложение. Ему нужно знать, где находится база данных. Самый простой вариант — захардкодить адрес прямо в коде:
+```python
+DATABASE_HOST = "localhost"
+```
 
-Если внутри `ConfigMap` хранится файл, Kubernetes монтирует его в контейнер как обычный volume. Это особенно удобно для nginx, application config’ов, `.env` файлов и других текстовых конфигураций.
+Однако база данных может находится не на `localhost`, а, например, доступна через Service `postgres.default.svc.cluster.local` Тогда придётся пересобрать Docker-образ под новую конфигурацию. Когда приложение развёрнуто при помощи простых средств оркестрации, вроде Docker-compose, мы можем просто пробросить volume на хост-систему, и таким образом менять конфигурацию. При работе с kubernetes, мы имеем дело с несколькими нодами, при этом предполагается что Pod может попасть на любую ноду - мы не должны этому препятствовать. В итоге один и тот же образ приходится пересобирать только потому, что поменялась конфигурация. Именно эту проблему и решают ConfigMap. При помощи ConfigMap мы можем устанавливать переменные среды для контейнера, и нам остаётся её только указать приложению:
+```python
+DATABASE_HOST = os.getenv("DATABASE_HOST")
+```
+Обьект `ConfigMap` и `Secret` могут подключаться к Pod’ам и как environment variables и как volume с файлами конфигурации.
 
-Продемонстрируем это на практике. Для начала создадим обычный файл:
+Рассмотрим применение ConfigMap для проброса volume. Для начала создадим обычный файл:
 ```bash
 echo 'hello world' > index.html
 ```
@@ -3164,15 +3169,25 @@ rm -f index.html
 
 Посмотрим содержимое ConfigMap:
 ```bash
-kubectl describe cm webindex
+kubectl get cm webindex -o yaml
 ```
 
-При необходимости ConfigMap можно изменять напрямую через Kubernetes API:
-```bash
-kubectl edit cm webindex
+В отличие от большинства ресурсов Kubernetes, ConfigMap практически целиком состоит из данных, поэтому отдельный раздел `spec` ему не требуется - тут сразу идёт раздел `data` в котором содержатся произвольные данные в формате `key: value`. В качестве key может выступать, например, имя файла или имя переменной среды: 
+```yaml
+apiVersion: v1
+data:
+  index.html: |
+    hello world
+kind: ConfigMap
+metadata:
+  creationTimestamp: "2026-06-12T02:47:00Z"
+  name: webindex
+  namespace: default
+  resourceVersion: "443954"
+  uid: 4b507288-e8bb-4e21-a2fc-ab40333d1876
 ```
 
-Теперь можно создать следующий Pod:
+Конкретная интерпритация данных определяется самим ресурсом использующим ConfigMap:
 
 ```yaml
 apiVersion: v1
@@ -3192,10 +3207,100 @@ spec:
       name: webindex
 ```
 
-После пересоздания Pod проверим содержимое файла внутри контейнера:
+После создания Pod проверим содержимое файла внутри контейнера:
 ```bash
 kubectl apply -f newwebserver.yaml
 kubectl exec -it newwebserver -- cat /usr/share/nginx/html/index.html
 ```
 
 Как мы видим, файл из `ConfigMap` автоматически примонтировался внутрь контейнера и стал доступен nginx как обычный файл в filesystem.
+
+Теперь рассмотрим пример, как мы можем загрузить переменные среды. Содержимое ConfigMap при этом остаётся таким же по формату:
+```yaml
+apiVersion: v1
+data:
+  MYVAR: Aboba!
+kind: ConfigMap
+metadata:
+  creationTimestamp: null
+  name: myvar
+```
+
+Использование этого ConfigMap в качестве переменных среды определяется самим Pod'ом:
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: env-configmap
+spec:
+  containers:
+    - name: app
+      command: ["sleep", "inf"]
+      image: busybox
+      envFrom:
+        - configMapRef:
+            name: myvar
+```
+
+Проверим:
+```bash
+kubectl apply -f myvar.yaml
+kubectl apply -f env-configmap.yaml
+kubectl exec -it env-configmap -- sh -c 'echo $MYVAR'
+```
+
+Кроме того, мы можем загрузить значения из ConfigMap в стороннюю переменную:
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: configmap-demo-pod
+spec:
+  containers:
+    - name: demo
+      image: alpine
+      command: ["sleep", "inf"]
+      env:
+        - name: EDITOR
+          valueFrom:
+            configMapKeyRef:
+              name: myvar
+              key: MYVAR
+```
+
+Посмотрим что получится:
+```bash
+kubectl apply -f configmap-demo-pod.yaml
+kubectl exec -it configmap-demo-pod -- sh -c 'echo $MYVAR'
+kubectl exec -it configmap-demo-pod -- sh -c 'echo $EDITOR'
+```
+Обратите внимание: переменная MYVAR внутри контейнера отсутствует. Мы явно указали, что значение из ключа MYVAR должно быть помещено в переменную EDITOR. Это позволяет переименовывать переменные независимо от структуры ConfigMap.
+
+То же самое можно выполнить и для файлов, мы можем размещать их содержимое по произвольному названию, не обязательно применять то название что указано в ConfigMap:
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: configmap-demo-pod2
+spec:
+  containers:
+    - name: demo
+      image: alpine
+      command: ["sleep", "3600"]
+      volumeMounts:
+      - name: message
+        mountPath: "/tmp"
+  volumes:
+  - name: message
+    configMap:
+      name: webindex
+      items:
+      - key: "index.html"
+        path: "message.txt"
+```
+
+Проверим:
+```bash
+kubectl apply -f configmap-demo-pod2.yaml
+kubectl exec -it configmap-demo-pod2 -- cat /tmp/message.txt
+```
