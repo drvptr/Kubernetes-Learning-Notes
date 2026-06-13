@@ -53,6 +53,7 @@
   - [18.2 Ручное создание PersistentVolume и PersistentVolumeClaim](#182-ручное-создание-persistentvolume-и-persistentvolumeclaim)
   - [18.3 Автоматическое Резервирование Пространства](#183-автоматическое-резервирование-пространства)
 - [19. ConfigMap и Secret](#19-configmap-и-secret)
+- [20. Probes](#20-probes)
 
 ## 1. Введение
 
@@ -3304,3 +3305,236 @@ spec:
 kubectl apply -f configmap-demo-pod2.yaml
 kubectl exec -it configmap-demo-pod2 -- cat /tmp/message.txt
 ```
+
+---
+
+## 20. Probes
+
+Kubernetes считает контейнер “живым”, если сам процесс внутри него продолжает работать. То есть если приложение запущено и контейнер не завершился с ошибкой, kubelet воспринимает это как нормальное состояние. Но на практике, тот факт что процесс активен не обязательно означает что само приложение работает. Например, веб-сервер nginx может возвращать ответ HTTP 500 - фактически в работе самого процесса nginx ошибок нет - ответ 500 вполне легитимный, его возвращает PHP-backend, например из-за ошибок в коде. С точки зрения Kubernetes это всё ещё “Running контейнер”, потому что сам процесс не упал. Для пользователей, при этом, сайт недоступен.
+
+Мы можем изменить это поведение, для этого в описании контейнера предусмотрены параметры **probes**. Они позволяют явно описать, что именно считается “здоровым” состоянием контейнера, и как Kubernetes должен это проверять.
+
+Существует три основных типа probes:
+- **liveness probe** определяет, жив ли контейнер с точки зрения работоспособности приложения — если она падает, Kubernetes перезапускает контейнер. 
+- **readiness probe** определяет, готов ли контейнер принимать трафик; если она не проходит, Pod убирается из балансировки и перестаёт получать запросы от Service, но сам контейнер при этом не перезапускается.
+- **startup probe** используется на этапе запуска приложения и проверяет, успело ли оно корректно стартовать; пока она не успешна, остальные проверки не выполняются, что особенно полезно для медленно стартующих приложений.
+
+Проверки могут выполняться несколькими способами: 
+- запуском команды внутри контейнера `exec` - в таком случае, если команда возвращает 0 проверка считается `success`,
+- HTTP-запросом `httpGet` - успехом считается ответ 200, остальные ответы 404, 403, 500 - неудачей.
+- TCP-подключением `tcpSocket` - проверка проходит если указанный порт открыт.
+- gRPC health check `grpc`. 
+Независимо от выбранного механизма, Kubernetes ожидает один из трёх результатов проверки: *Success* — проверка успешна; *Failure* — проверка не пройдена; *Unknown* — результат определить не удалось, Kubernetes не предпринимает действий и повторяет проверку позже.
+
+Рассмотрим пример liveness probe с использованием `exec`:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: probe-demo
+spec:
+  containers:
+  - name: app
+    image: busybox
+    command: [ 'sh', '-c', 'touch /tmp/healthy && sleep inf' ]
+    livenessProbe:
+      exec:
+        command: [ 'test', '-f', '/tmp/healthy' ]
+      initialDelaySeconds: 5
+      periodSeconds: 1
+      failureThreshold: 1
+```
+После запуска контейнер создаёт файл `/tmp/healthy`. Каждую секунду kubelet выполняет `test`. Здесь: **initialDelaySeconds** — сколько секунд ждать после запуска контейнера перед первой проверкой. **periodSeconds** — как часто выполнять проверку. По умолчанию — каждые 10 секунд. **failureThreshold** — сколько неудачных проверок подряд требуется, чтобы Kubernetes признал probe неуспешной.
+
+Создадим Pod и убедимся что он работает корректно:
+
+```bash
+kubectl apply -f probe-demo.yaml
+kubectl get pod probe-demo
+sleep 10
+```
+
+Теперь удалим файл, и проверим что произойдёт:
+
+```bash
+kubectl get pod probe-demo
+kubectl exec -it probe-demo -- rm /tmp/healthy
+kubectl get pod probe-demo
+kubectl get pod probe-demo
+```
+
+Можем заметить, что спустя некоторое время, `RESTARTS` изменилось на 1. После удаления файла, контейнер признается неисправным и перезапускается. Таким образом, liveness probe позволяет самостоятельно определить, что именно считать "живым" приложением, а не ограничиваться фактом существования процесса. Но такой тип probe применим не во всех случаях. Представим, если бы у нас веб-сервер nginx возвращал 503 по причине включенного режима технических работ Wordpress. В таком случае, наш контейнер начал бы пересоздаваться, что никак не помогло обеспечить доступность сайта для пользователей, так в добавок ещё и помешало веб-разработчикам получить доступ к сайту. 
+
+Для такого случая, мы можем использовать `readinessProbe`. Продемонстрируем это на практике. Рассмотрим следующий манифест:
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  creationTimestamp: null
+  labels:
+    app: website
+  name: website
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: website
+  strategy: {}
+  template:
+    metadata:
+      creationTimestamp: null
+      labels:
+        app: website
+    spec:
+      containers:
+      - image: nginx
+        name: nginx
+        volumeMounts:
+          - name: webconfig
+            mountPath: "/etc/nginx/conf.d"
+      - image: 'bitnami/php-fpm'
+        name: php
+        volumeMounts:
+          - name: webindex
+            mountPath: "/var/www/html/index.php"
+            subPath: index.php
+            readOnly: false
+          - name: persistent
+            mountPath: /tmp
+      volumes:
+        - name: webindex
+          configMap:
+            name: website-cm
+            items:
+              - key: 'index.php'
+                path: 'index.php'
+        - name: webconfig
+          configMap:
+            name: website-cm
+            items:
+              - key: 'default'
+                path: 'default.conf'
+        - name: persistent
+          hostPath:
+            path: /tmp
+            type: Directory
+status: {}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: website-cm
+data:
+  index.php: |
+    <?php
+    if (file_exists("/tmp/error.txt")) {
+        while (true) {
+            sleep(1);
+        }
+    }
+    echo "The fate of the world is safe in Crystal Castles !\n";
+  default: |
+    server {
+        listen 80 default_server;
+        root /var/www/html;
+        index index.php index.html;
+        location / {
+          try_files $uri $uri/ /index.php?$query_string;
+        }
+        location ~ \.php$ {
+          fastcgi_pass 127.0.0.1:9000;
+          fastcgi_index index.php;
+          fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+          fastcgi_connect_timeout 3s;
+          fastcgi_send_timeout 3s;
+          fastcgi_read_timeout 3s;
+          include fastcgi_params;
+        }
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  creationTimestamp: null
+  labels:
+    app: website
+  name: website-svc
+spec:
+  ports:
+  - port: 80
+    protocol: TCP
+    targetPort: 80
+  selector:
+    app: website
+status:
+  loadBalancer: {}
+```
+Тут создаётся deployment с двумя репликами, в каждой из которых по два контейнера. Первый контейнер - это веб-сервер nginx, второй - php-fpm. Применим манифест и посмотрим что у нас будет создано:
+```bash
+kubectl apply -f website.yaml
+kubectl get svc website-svc
+curl 10.97.201.67
+```
+Как мы видим, у нас есть сервис с нашим сайтом. При обращении к нему, он выдаёт сообщение. Представим, что после очередного обновления разработчики допустили ошибку, из-за которой обработка запросов в PHP-приложении начала зависать. Сам процесс php-fpm продолжает работать, однако больше не способен корректно обслуживать пользователей:
+```bash
+kubectl get pods --selector='app=website'
+kubectl exec -it website-5d5fd6ccd9-5p64g -c php -- touch /tmp/error.txt
+```
+Проверим доступность сайта теперь. Сделать это необходимо несколько раз:
+```
+curl 10.97.201.67
+curl 10.97.201.67
+curl 10.97.201.67
+```
+Как мы видим, периодически запрос зависает, и через 3 секунды выдаёт 504 Timeout. Тогда удалим всё что мы создали, и попробуем добавить в `spec.template.spec.container[0]` livenessProbe:
+```yaml
+#...
+    livenessProbe:
+      httpGet:
+        path: /
+        port: 80
+      initialDelaySeconds: 1
+      periodSeconds: 5
+      timeoutSeconds: 4
+      failureThreshold: 1
+#...
+```
+Тут, *timeoutSeconds* — сколько ждать ответа от проверки перед тем, как считать её неуспешной.
+
+Проверим что получится при заражении сайта:
+```bash
+kubectl delete -f website.yaml
+ssh worker1 'rm /tmp/error.txt'
+vim website.yaml
+kubectl apply -f website.yaml
+kubectl get pods --selector='app=website'
+kubectl get svc website-svc
+kubectl exec -it website-646f9c8c7f-bsr6j -c php -- touch /tmp/error.txt
+kubectl get pods --selector='app=website'
+curl 10.103.225.78
+curl 10.103.225.78
+curl 10.103.225.78
+kubectl get pods --selector='app=website'
+```
+И ничего не поменялось. Зато Pod успел целых два раза рестартануть! Что, как можно догадаться, по сути только вредит человеку который будет пытаться это отладить. Изменим тип probe с `livenessProbe` на `readinessProbe` и пересоздадим деплой:
+```bash
+kubectl delete -f website.yaml
+ssh worker1 'rm /tmp/error.txt'
+vim website.yaml
+kubectl apply -f website.yaml
+kubectl get pods --selector='app=website'
+kubectl get svc website-svc
+```
+
+Что же произойдёт теперь в случае заражения:
+```bash
+kubectl get endpoints website-svc
+kubectl exec -it website-9869f8dc6-mr9vx -c php -- touch /tmp/error.txt
+curl 10.99.227.171
+curl 10.99.227.171
+curl 10.99.227.171
+kubectl get pods --selector='app=website'
+kubectl get endpoints website-svc
+```
+Как мы видим, сайт не утратил доступности: Endpoint неисправного Pod исчез из списка Endpoints сервиса, и весь пользовательский трафик автоматически начал направляться только на исправную реплику. При этом сам Pod не был перезапущен и продолжил работать, что позволяет администраторам и разработчикам исследовать проблему непосредственно в работающем окружении.
