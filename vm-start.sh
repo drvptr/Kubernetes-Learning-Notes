@@ -21,7 +21,7 @@ for VM in $(ls /vm/*.qcow2) ; do
 done
 
 if [ $CHANGED -eq 1 ] ; then
-	sleep 30
+	sleep 40
 fi
 
 WAN_IP="$(arp-scan --interface=br-wan --localnet 2> /dev/null | grep '52:54:00:66:bf:48' | cut  -f 1,1)"
