@@ -56,6 +56,7 @@
 - [20. Probes](#20-probes)
 - [21. Downward API](#20-downward-api)
 - [22. Kubernetes аутентификация](#22-kubernetes-аутентификация)
+- [23. Конфигурация CoreDNS](#23-конфигурация-coredns)
 
 ## 1. Введение
 
@@ -3714,6 +3715,31 @@ kubectl exec playground-volume -- cat /etc/podinfo/pod-name
 ```
 Команда выведет playground-volume. Таким образом, Downward API позволяет безопасно предоставить контейнеру информацию о самом Pod, не выдавая ему дополнительных прав доступа к кластеру Kubernetes.
 
+Стоит подчеркнуть что **Downward API всегда работает только с объектом Pod**, а не с Deployment, ReplicaSet или другими контроллерами Kubernetes. Например, если Pod был создан Deployment'ом, то выражение:
+
+```yaml
+env:
+- name: POD_NAME
+  valueFrom:
+    fieldRef:
+      fieldPath: metadata.name
+```
+
+вернёт имя конкретного Pod, например `web-6b8d9f5d8c-7k2mv` а не имя Deployment `web`. Это связано с тем, что контейнеры запускаются внутри Pod, и именно спецификация Pod доступна kubelet во время запуска контейнера. По этой же причине через Downward API нельзя напрямую получить имя Deployment или ReplicaSet. Если необходимо передать имя родительского объекта, обычно используют labels или annotations, которые затем читаются через `fieldRef`.
+
+При использовании `resourceFieldRef` по умолчанию ресурсы читаются из текущего контейнера. Однако можно явно получить ресурсы другого контейнера того же Pod, для этого необходимо указать `containerName`:
+
+```yaml
+env:
+- name: SIDECAR_CPU_REQUEST
+  valueFrom:
+    resourceFieldRef:
+      containerName: sidecar
+      resource: requests.cpu
+```
+
+Таким образом контейнеры внутри одного Pod могут получать информацию о `requests` и `limits` друг друга. А вот тип `fieldRef` вообще не позволяет обращаться к произвольным полям других контейнеров, например к `spec.containers[0].resources.requests.cpu`; для доступа к ресурсам других контейнеров предусмотрен исключительно механизм `resourceFieldRef` с указанием параметра `containerName`.
+
 ---
 
 ## 22. Kubernetes аутентификация
@@ -4016,54 +4042,160 @@ kubectl get cm -n kube-system coredns -o yaml
 corp.local:53 {
     ...
 }
+.:53 {
+    ...
+}
 ```
-
-будет применяться только к запросам вида `db.corp.local`, `vpn.corp.local` и другим именам внутри зоны `corp.local`. Если запрос подходит сразу под несколько зон, используется наиболее специфичная. Например, запрос `db.corp.local` попадёт в блок `corp.local:53`, а не в `.:53`.
+При такой конфигурации, специфичные правила будут применяться только к запросам вида `db.corp.local`, `vpn.corp.local` и другим именам внутри зоны `corp.local`. Если запрос подходит сразу под несколько зон, используется наиболее специфичная. Например, запрос `db.corp.local` попадёт в блок `corp.local:53`, а не в `.:53`.
 
 Внутри каждого блока располагаются **плагины**, которые выполняются сверху вниз и определяют поведение DNS-сервера. Например:
 
 ```txt
 .:53 {
-    errors
-    cache 30
+    # errors
+    # cache 30
     forward . /etc/resolv.conf
 }
 ```
 
-Плагин `errors` включает вывод ошибок в журнал. `cache 30` кэширует DNS-ответы на 30 секунд, уменьшая нагрузку на вышестоящие DNS-серверы. Плагин `forward` пересылает запросы другому DNS-серверу. В примере выше запись:
-
+Плагин `errors` включает вывод ошибок в журнал. `cache 30` кэширует DNS-ответы на 30 секунд, уменьшая нагрузку на вышестоящие DNS-серверы. Плагин `forward` пересылает запросы другому DNS-резолверу, который указан в виде IP или файла формата resolv.conf. Для нас важны плагины `forward` и `kubernetes` - означает обработать запрос собственным резолвером corends. Получается примерно следующий синтаксис:
 ```txt
-forward . /etc/resolv.conf
-```
-означает: "все запросы, которые дошли до этого места, пересылать DNS-серверам, указанным в `/etc/resolv.conf`".
-
-Чаще всего встречаются следующие директивы:
-* `forward` — пересылает запросы внешнему DNS-серверу.
-* `cache` — кэширует ответы.
-* `reload` — автоматически перечитывает конфигурацию при изменении Corefile.
-* `loop` — обнаруживает циклические пересылки DNS-запросов.
-* `loadbalance` — перемешивает порядок возвращаемых адресов, распределяя нагрузку между несколькими IP.
-* `health` — предоставляет endpoint проверки состояния CoreDNS.
-* `ready` — сообщает Kubernetes, готов ли CoreDNS обслуживать запросы.
-* `prometheus` — публикует метрики для Prometheus.
-* `errors` — выводит ошибки обработки запросов в журнал.
-* `kubernetes` — реализует встроенный DNS Kubernetes. Отвечает за разрешение имён сервисов и подов, например `nginx.default.svc.cluster.local`.
-
-Рассмотрим вызов плигина `kubernetes`, его синтаксис:
-```txt
-kubernetes <cluster-domain> [дополнительные зоны...] {
+<dns-zone.com>:53 {
+    kubernetes <cluster-domain.local> [cluster-domain2.local] [... etc] {
+    }
+    forward <domain.info> <resolver-IP or IP:Port or resolv.conf>  [...same etc] {
+    }
+}
+<dns-zone2.com>:53 {
     ...
 }
 ```
-То есть запросы к именам внутри `cluster.local` обслуживаются самим Kubernetes.
-
-Если требуется настроить отдельную пересылку для корпоративной зоны, создаётся дополнительный server block:
-
+В качестве практики выполним следующее упражнение. Допустим у нас есть тестовый Pod:
+```bash
+kubectl run test --image=curlimages/curl -- sleep inf
+```
+Мы можем из него отправлять запросы, например к google или к ресурсам в нашем кластере:
+```
+kubectl exec -it test -- curl -I https://www.google.com
+kubectl exec -it test -- curl -I http://webstress.default.svc.cluster.local
+```
+Но попробуем допустим подключиться к сайту grep.geek:
+```bash
+kubectl exec -it test -- curl -I http://grep.geek
+```
+Должны увидеть ошибку `Could not resolve host`, потому что домены .geek относятся к любительской сети DNS "OpenNIC". Для нас не важно, что именно выступает сторонним DNS. Вместо OpenNIC это мог бы быть корпоративный BIND-сервер, Active Directory DNS или любой другой DNS-резолвер. Отредактируем coredns таким образом, чтобы сайт стал доступным `kubectl -n kube-system edit cm coredns`:
 ```txt
-corp.local:53 {
-    forward . 10.10.10.50
-}
+    .:53 {
+        errors
+        health {
+           lameduck 5s
+        }
+        ready
+        kubernetes cluster.local in-addr.arpa ip6.arpa {
+           pods insecure
+           fallthrough in-addr.arpa ip6.arpa
+           ttl 30
+        }
+        prometheus :9153
+        forward . /etc/resolv.conf {
+           max_concurrent 1000
+        }
+        cache 30 {
+           disable success cluster.local
+           disable denial cluster.local
+        }
+        loop
+        reload
+        loadbalance
+    }
+    geek.:53 {
+      forward . 195.10.195.195
+    }
+```
+Проверим теперь:
+```bash
+kubectl -n kube-system rollout restart deployment coredns
+kubectl exec -it test -- curl -I http://grep.geek
+```
+Мы успешно смогли подключится к ресурсу. Также вместо отдельного блока можно использовать `froward geek 195.10.195.195` в основном блоке:
+```txt
+    .:53 {
+        errors
+        health {
+           lameduck 5s
+        }
+        ready
+        kubernetes cluster.local in-addr.arpa ip6.arpa {
+           pods insecure
+           fallthrough in-addr.arpa ip6.arpa
+           ttl 30
+        }
+        prometheus :9153
+	forward geek 195.10.195.195
+        forward . /etc/resolv.conf {
+           max_concurrent 1000
+        }
+        cache 30 {
+           disable success cluster.local
+           disable denial cluster.local
+        }
+        loop
+        reload
+        loadbalance
+    }
 ```
 
-В этом случае запросы вида `db.corp.local` будут отправляться на DNS-сервер `10.10.10.50`, тогда как все остальные продолжат обрабатываться обычным блоком `.:53`.
+Кроме CoreDNS, настройки DNS могут быть заложены в спецификации самого Pod'а. Мы можем задавать Pod'ам hostname:
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    run: nginx
+  name: web
+spec:
+  hostname: noginxxx
+  subdomain: web-svc # subdomain должен матчится с именем service
+  containers:
+  - image: nginx
+    name: test
+```
+Сам по себе hostname простро настраивает имя хоста, которое никак не влияет на DNS. Однако "hostname + subdomain + pod + service" совместно дают DNS запись для указанного hostname. Например, создадим вышеуказанный yaml:
+```bash
+kubectl apply -f web.yaml
+kubectl expose pod web --port=80 --name='web-svc' --cluster-ip=None
+```
+Теперь мы можем обратиться к нему по hostname:
+```bash
+kubectl exec -it test -- curl -I http://noginxxx.web-svc.default.svc.cluster.local
+```
+А могли бы и обратиться по IP:
+```bash
+kubectl exec -it test -- curl -I http://192-168-189-127.default.pod.cluster.local
+```
+Но, как мы знаем, этот IP-адрес не стабилен, и может меняться при пересоздании Pod'а.
 
+Важно отметить, что в случае с deployment и statefulset, подобное поведение не возникает - Pod'ы не начинают резолвиться по hostname. В данном случае явное указание hostname не даёт вообще **ничего**! Deploy сам устанавливает hostname для своих Pod. Кстати, в случае с statefulset, Pod'ы резолвятся по своему стабильному имени, например `web-0.web-svc.default.svc.cluster.local`. 
+
+По умолчанию каждый Pod получает DNS-конфигурацию Kubernetes запросы к сервисам кластера `*.svc.cluster.local` обрабатываются CoreDNS, а все остальные запросы пересылаются на вышестоящие DNS-серверы.  С помощью поля `spec.dnsPolicy` можно изменить источник DNS-конфигурации Pod. Поддерживаются следующие значения:
+* `ClusterFirst` — использовать CoreDNS Kubernetes (значение по умолчанию);
+* `Default` — использовать DNS-конфигурацию **ноды**, на которой запущен Pod;
+* `ClusterFirstWithHostNet` — использовать CoreDNS даже если Pod запущен с `hostNetwork: true` - параметр заставляет Pod использовать реальную сеть ноды вместо собственной сети Kubernetes.
+* `None` - настройки DNS игнорируются, используются только настройки внутри самого Pod'а. Кстати, о них...
+
+Настройки DNS для конкретного Pod можно задать в секции `spec.dnsConfig`:
+
+```yaml
+spec:
+  dnsPolicy: None
+  dnsConfig:
+    nameservers:
+    - 1.1.1.1
+    searches:
+    - corp.local
+    options:
+    - name: ndots
+      value: "2"
+```
+
+Параметр `nameservers` задаёт дополнительные DNS-серверы, `searches` — список поисковых доменов, а `options` позволяет настроить параметры работы DNS-резолвера. Эти настройки объединяются с конфигурацией, полученной из `dnsPolicy`.
